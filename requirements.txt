@@ -1,0 +1,12 @@
+# Python 3.10, CUDA 12.1
+# PyG extensions are built for this torch wheel:
+#   pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.1.2+cu121.html
+
+torch==2.1.2+cu121
+torch-geometric==2.5.2
+torch-scatter==2.1.2+pt21cu121
+torch-sparse==0.6.18+pt21cu121
+torch-cluster==1.6.3+pt21cu121
+numpy==1.24.3
+scikit-learn==1.4.2
+networkx==3.1

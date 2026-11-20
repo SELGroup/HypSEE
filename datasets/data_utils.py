@@ -1,0 +1,314 @@
+import torch
+from torch_cluster import random_walk
+from torch_geometric.utils import add_remaining_self_loops, dense_to_sparse, remove_self_loops
+from torch_geometric.data import Data
+from torch_sparse import spspmm, coalesce
+# from torch_geometric.utils import unbatch_edge_index
+from datasets.tu_dataset import get_dataset
+from torch_geometric.io import fs
+import os
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+
+class TwoHopNeighbor(object):
+    def __call__(self, data):
+        edge_index, edge_attr = data.edge_index, data.edge_attr
+        N = data.num_nodes
+
+        value = edge_index.new_ones((edge_index.size(1), ), dtype=torch.float)
+
+        index, value = spspmm(edge_index, value, edge_index, value, N, N, N, True)
+        value.fill_(0)
+        index, value = remove_self_loops(index, value)
+
+        edge_index = torch.cat([edge_index, index], dim=1)
+        if edge_attr is None:
+            data.edge_index, _ = coalesce(edge_index, None, N, N)
+        else:
+            value = value.view(-1, *[1 for _ in range(edge_attr.dim() - 1)])
+            value = value.expand(-1, *list(edge_attr.size())[1:])
+            edge_attr = torch.cat([edge_attr, value], dim=0)
+            data.edge_index, edge_attr = coalesce(edge_index, edge_attr, N, N)
+            data.edge_attr = edge_attr
+
+        return data
+
+    def __repr__(self):
+        return '{}()'.format(self.__class__.__name__)
+
+
+
+
+def precompute_hypergraphs(data_name, data_root, hyperedge_length, num_edges=32, seed=0):
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+    torch.manual_seed(seed)
+    dataset = get_dataset(name=data_name, root=data_root)
+    hypergraph_dict = {}
+    store_path = os.path.join(data_root, data_name, "RW", "len_{}.pt".format(int(hyperedge_length)))
+    os.makedirs(os.path.dirname(store_path), exist_ok=True)
+    for data in dataset:
+        graph_id = data.graph_id.item()
+        assert data.num_nodes is not None
+        num_nodes = data.num_nodes
+        sampled_nodes = torch.randint(0, num_nodes, (num_edges,), generator=rng)
+        row, col = data.edge_index
+        walk = random_walk(row, col, start=sampled_nodes, walk_length=hyperedge_length)
+        if isinstance(walk, tuple):
+            walk = walk[0]
+        walk_vertex_indices = walk.flatten()
+        walk_edge_indices = torch.arange(num_edges).unsqueeze(-1).repeat(1, hyperedge_length+1).flatten()
+        walk_indices = torch.stack([walk_vertex_indices, walk_edge_indices], dim=0)
+        walk_values = torch.ones_like(walk_indices[0,:].squeeze(), dtype=torch.float)
+        hypergraph = torch.sparse_coo_tensor(indices=walk_indices, values=walk_values, size=(num_nodes, num_edges))
+        hypergraph = hypergraph.coalesce()
+        walk_values = torch.ones_like(hypergraph.indices()[0,:].squeeze(), dtype=torch.float)
+        hypergraph = torch.sparse_coo_tensor(indices=hypergraph.indices(), values=walk_values, size=(num_nodes, num_edges), is_coalesced=True)
+        hypergraph_dict[graph_id] = hypergraph
+    fs.torch_save(hypergraph_dict, store_path)
+
+
+
+
+
+
+def load_hypergraphs(data_name, data_root, hyperedge_length_list, num_edges, num_graphs, seed=0):
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+    indices_dict = {}
+    values_dict = {}
+    size_dict = {}
+    for i in range(num_graphs):
+        indices_dict[i] = []
+        values_dict[i] = []
+        size_dict[i] = (0,0)
+    num_edges_list = []
+    for i in range(len(hyperedge_length_list)-1):
+        num_edges_list.append(int(num_edges / len(hyperedge_length_list)))
+    num_edges_list.append(num_edges - np.sum(num_edges_list))
+    for i, hyperedge_length in enumerate(hyperedge_length_list):
+        num_edges_i = num_edges_list[i]
+        store_path = os.path.join(data_root, data_name, "RW", "len_{}.pt".format(int(hyperedge_length)))
+        hypergraph_dict = fs.torch_load(store_path)
+        for graph_id in hypergraph_dict.keys():
+            indices = hypergraph_dict[graph_id].indices()
+            values = hypergraph_dict[graph_id].values()
+            size = hypergraph_dict[graph_id].size()
+            # print(indices)
+            # print(values)
+            # print(size)
+            # print(num_edges_i)
+            # assert num_edges_i <= size[1]
+            hyperedge_ids = torch.randint(0, size[1], (num_edges_i,), generator=rng)
+            mask = torch.isin(indices[1,:], hyperedge_ids)
+            selected_indices = indices[:,mask]
+            unique_values, new_values = torch.unique(selected_indices[1,:], return_inverse=True)
+            selected_indices[1,:] = new_values + size_dict[graph_id][1]
+            indices_dict[graph_id].append(selected_indices)
+            values_dict[graph_id].append(values[mask])
+            size_dict[graph_id] = (size[0], size_dict[graph_id][1]+num_edges_i)
+            ##
+            # indices = hypergraph_dict[graph_id].indices()
+            # indices[1,:] += size_dict[graph_id][1]
+            # indices_dict[graph_id].append(indices)
+            # # indices_dict[graph_id].append(hypergraph_dict[graph_id].indices())
+            # values_dict[graph_id].append(hypergraph_dict[graph_id].values())
+            # # size_i = hypergraph_dict[graph_id].size()
+            # # size_dict[graph_id] = (size_i[0], size_dict[graph_id][1] + si)
+            # size_dict[graph_id][0] = hypergraph_dict[graph_id].size()[0]
+            # # size_dict[graph_id][1] += hypergraph_dict[graph_id].size()[1]
+    result_hg_dict = {}
+    for graph_id in indices_dict.keys():
+        indices = torch.cat(indices_dict[graph_id], dim=-1)
+        values = torch.cat(values_dict[graph_id], dim=-1)
+        size = size_dict[graph_id]
+        hypergraph = torch.sparse_coo_tensor(indices=indices, values=values, size=size, is_coalesced=True)
+        result_hg_dict[graph_id] = hypergraph
+    return result_hg_dict
+
+
+class HypergraphDenseBatchCache:
+    """Cache dense incidence matrices H for fixed (hypergraph seed, batch graph_ids).
+
+    Entries are stored on CPU so GPU memory is not held between batches.
+    Invalidate via :meth:`set_version` when a new training run rebuilds the data split.
+    """
+
+    def __init__(self) -> None:
+        self._version: Optional[int] = None
+        self._cache: Dict[Tuple[int, Tuple[int, ...], int], torch.Tensor] = {}
+
+    def set_version(self, version: int) -> None:
+        if self._version != version:
+            self._version = version
+            self.clear()
+
+    @property
+    def version(self) -> Optional[int]:
+        return self._version
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def get(
+        self,
+        graph_id_list: Sequence[int],
+        num_edges: int,
+    ) -> Optional[torch.Tensor]:
+        if self._version is None:
+            return None
+        key = (self._version, tuple(int(g) for g in graph_id_list), int(num_edges))
+        return self._cache.get(key)
+
+    def put(
+        self,
+        graph_id_list: Sequence[int],
+        num_edges: int,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._version is None:
+            raise RuntimeError("HypergraphDenseBatchCache version is not set")
+        key = (self._version, tuple(int(g) for g in graph_id_list), int(num_edges))
+        stored = tensor.detach().cpu()
+        if stored.data_ptr() == tensor.data_ptr():
+            stored = stored.clone()
+        self._cache[key] = stored
+        return tensor
+
+
+def _default_device() -> torch.device:
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def _hypergraph_to_dense_batch_impl(
+    hypergraph_dict,
+    graph_id_list: Sequence[int],
+    num_edges: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build a dense batched incidence matrix on ``device`` with one scatter.
+
+    Matches per-graph ``sparse_coo_tensor(..., size=(max_nodes, num_edges)).coalesce().to_dense()``
+    stacked on dim 0: padded rows are zero, duplicate (v, e) entries are summed.
+    """
+    batch_size = len(graph_id_list)
+    max_num_nodes = max(
+        int(hypergraph_dict[graph_id].size()[0]) for graph_id in graph_id_list
+    )
+    num_edges = int(num_edges)
+    H = torch.zeros(
+        batch_size, max_num_nodes, num_edges, device=device, dtype=dtype,
+    )
+    batch_ids: List[torch.Tensor] = []
+    rows: List[torch.Tensor] = []
+    cols: List[torch.Tensor] = []
+    vals: List[torch.Tensor] = []
+    for b, graph_id in enumerate(graph_id_list):
+        hypergraph_i = hypergraph_dict[graph_id]
+        if not hypergraph_i.is_coalesced():
+            hypergraph_i = hypergraph_i.coalesce()
+        indices = hypergraph_i.indices()
+        if indices.size(1) == 0:
+            continue
+        nnz = indices.size(1)
+        batch_ids.append(
+            torch.full((nnz,), b, dtype=torch.long, device=indices.device)
+        )
+        rows.append(indices[0])
+        cols.append(indices[1])
+        vals.append(hypergraph_i.values())
+    if not batch_ids:
+        return H
+    batch_i = torch.cat(batch_ids).to(device=device, non_blocking=True)
+    row = torch.cat(rows).to(device=device, non_blocking=True)
+    col = torch.cat(cols).to(device=device, non_blocking=True)
+    value = torch.cat(vals).to(device=device, dtype=dtype, non_blocking=True)
+    flat = batch_i * (max_num_nodes * num_edges) + row * num_edges + col
+    H.view(-1).scatter_add_(0, flat, value)
+    return H
+
+
+def hypergraph_to_dense_batch(
+    hypergraph_dict,
+    graph_id_list: Sequence[int],
+    num_edges: int,
+    device: Optional[Union[torch.device, str]] = None,
+    dtype: torch.dtype = torch.float32,
+    cache: Optional[HypergraphDenseBatchCache] = None,
+) -> torch.Tensor:
+    """Convert sparse hypergraphs to a dense batch ``(B, max_nodes, num_edges)``.
+
+    Construction uses a vectorized scatter on ``device``. Optional ``cache``
+    stores a CPU copy keyed by ``(cache.version, tuple(graph_id_list), num_edges)``.
+    """
+    graph_id_list = [int(g) for g in graph_id_list]
+    dev = _default_device() if device is None else torch.device(device)
+    if cache is not None:
+        cached = cache.get(graph_id_list, num_edges)
+        if cached is not None:
+            out = cached.to(device=dev, dtype=dtype, non_blocking=True)
+            if out.data_ptr() == cached.data_ptr():
+                out = out.clone()
+            return out
+
+    out = _hypergraph_to_dense_batch_impl(
+        hypergraph_dict, graph_id_list, num_edges, dev, dtype,
+    )
+
+    if cache is not None:
+        cache.put(graph_id_list, num_edges, out)
+    return out
+
+
+def k_fold(dataset, folds, seed):
+    skf = StratifiedKFold(folds, shuffle=True, random_state=seed)
+    labeled_train_indices, unlabeled_train_indices, test_indices, val_indices = [], [], [], []
+    split_indices = []
+    for _, idx in skf.split(torch.zeros(len(dataset)), dataset.y):
+        # print(idx)
+        split_indices.append(torch.from_numpy(idx))
+    # print(len(test_indices))
+    for i in range(folds):
+        val_indices.append(split_indices[i-2])
+        test_indices.append(torch.cat([split_indices[i-1], split_indices[i]], dim=-1))
+    skf_semi = StratifiedKFold(folds-3, shuffle=True, random_state=seed)
+    for i in range(folds):
+        train_mask = torch.ones(len(dataset), dtype=torch.uint8)
+        train_mask[test_indices[i].long()] = 0
+        train_mask[val_indices[i].long()] = 0
+        idx_train = train_mask.nonzero(as_tuple=False).view(-1)
+
+        labeled_train_indices_i = []
+        for _, idx in skf_semi.split(torch.zeros(idx_train.size()[0]), dataset[idx_train].y):
+            idx_train_j = idx_train[idx]
+            labeled_train_indices_i.append(idx_train_j)
+            if len(labeled_train_indices_i) >= 2:
+                break
+        # assert labeled_train_indices_i == 2
+        labeled_train_indices.append(labeled_train_indices_i[0])
+        labeled_train_indices_i = torch.cat(labeled_train_indices_i, dim=-1)
+        train_mask[labeled_train_indices_i.long()] = 0
+        idx_train_unlabeled = train_mask.nonzero(as_tuple=False).view(-1)
+        unlabeled_train_indices.append(idx_train_unlabeled)
+    return labeled_train_indices, unlabeled_train_indices, val_indices, test_indices
+
+
+
+
+
+if __name__=='__main__':
+    data_name = "REDDIT-MULTI-5K"
+    data_root = "/mnt/data/zengguangjie/HypSEE/data/REDDIT-MULTI-5K"
+    # hyperedge_length = 2
+    for hyperedge_length in range(2, 11):
+        print(hyperedge_length)
+        precompute_hypergraphs(data_name, data_root, hyperedge_length, num_edges=64, seed=0)
+
+    store_path = os.path.join(data_root, data_name, "RW", "len_{}.pt".format(int(hyperedge_length)))
+    hypergraph_dict = fs.torch_load(store_path)
+    print(hypergraph_dict)
+
+
