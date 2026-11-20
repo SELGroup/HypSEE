@@ -25,11 +25,7 @@ The full environment is listed in `requirements.txt`.
 ## Training
 
 ```bash
-# Dataset JSON hyperparameters (default; CLI flags override the file)
 python main.py --data_name PROTEINS
-
-# argparse defaults only
-python main.py --data_name PROTEINS --no_config_file --epochs 100
 ```
 
 
